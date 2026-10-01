@@ -2,6 +2,7 @@ pub mod client;
 pub mod element;
 pub mod error;
 pub mod query;
+pub mod server;
 pub mod traits;
 
 pub use client::Client;

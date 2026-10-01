@@ -100,10 +100,7 @@ fn build_query(cli: &Cli) -> Query {
         q = q.kind(k.into());
     }
     for t in &cli.tag {
-        q = match t.split_once('=') {
-            Some((k, v)) => q.tag(k, v),
-            None => q.tag_exists(t.as_str()),
-        };
+        q = q.tag_expr(t);
     }
     if let Some(b) = cli.bbox {
         q = q.within(Area::Bbox(b));

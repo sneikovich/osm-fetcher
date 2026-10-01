@@ -65,6 +65,14 @@ impl Query {
         self
     }
 
+    /// Parse a CLI-style filter: `key=value` → [`Self::tag`], bare `key` → [`Self::tag_exists`].
+    pub fn tag_expr(self, expr: &str) -> Self {
+        match expr.split_once('=') {
+            Some((k, v)) => self.tag(k, v),
+            None => self.tag_exists(expr),
+        }
+    }
+
     pub fn within(mut self, area: Area) -> Self {
         self.area = Some(area);
         self
