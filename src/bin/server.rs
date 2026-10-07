@@ -1,5 +1,6 @@
 use clap::Parser;
 use overpass::client::{DEFAULT_ENDPOINT, DEFAULT_RETRIES};
+use overpass::history::History;
 use overpass::{Client, Error};
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -19,6 +20,10 @@ struct Cli {
     /// Retries when the upstream is busy (429/504)
     #[arg(long, env = "OVERPASS_RETRIES", default_value_t = DEFAULT_RETRIES)]
     retries: u32,
+
+    /// Base URL of the history service (e.g. http://history:8081); unset disables logging
+    #[arg(long, env = "HISTORY_URL")]
+    history_url: Option<String>,
 }
 
 fn report_retry(err: &Error, delay: Duration) {
@@ -44,6 +49,13 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let history = match cli.history_url.as_deref().map(History::new).transpose() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: history client: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let listener = match tokio::net::TcpListener::bind(cli.listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -51,9 +63,14 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("listening on {} → {}", cli.listen, cli.endpoint);
+    eprintln!(
+        "listening on {} → {}, history: {}",
+        cli.listen,
+        cli.endpoint,
+        cli.history_url.as_deref().unwrap_or("off")
+    );
 
-    let app = overpass::server::router(client);
+    let app = overpass::server::router(client, history);
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

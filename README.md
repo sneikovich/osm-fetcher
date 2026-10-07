@@ -52,8 +52,11 @@ OVERPASS_LISTEN=127.0.0.1:9000 OVERPASS_ENDPOINT=https://overpass.private.coffee
 | `OVERPASS_LISTEN` | `--listen` | `0.0.0.0:8080` |
 | `OVERPASS_ENDPOINT` | `--endpoint` | `https://overpass-api.de/api/interpreter` |
 | `OVERPASS_RETRIES` | `--retries` | `3` |
+| `HISTORY_URL` | `--history-url` | не задано: логування вимкнене |
 
 Endpoint задається лише на сервері, клієнт API його змінити не може. Сервер коректно завершується по SIGTERM/SIGINT.
+
+Якщо задано `HISTORY_URL`, після кожного запиту з валідним JSON фетчер у фоні шле подію в `POST {HISTORY_URL}/events` ([../history/README.md](../history/README.md)). Таймаут відправки 2 с. Помилка відправки йде лише в stderr (`history: ...`) і на відповідь клієнту не впливає.
 
 ### `POST /api/query`
 

@@ -1,6 +1,7 @@
 pub mod client;
 pub mod element;
 pub mod error;
+pub mod history;
 pub mod query;
 pub mod server;
 pub mod traits;

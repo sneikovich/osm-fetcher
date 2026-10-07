@@ -3,14 +3,17 @@
 use crate::Client;
 use crate::element::{Coord, ElementKind, Response};
 use crate::error::Error;
+use crate::history::{Event, History};
 use crate::query::{Area, Bbox, DEFAULT_TIMEOUT, Query};
 use axum::Router;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::http::StatusCode;
+use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use serde::Deserialize;
+use std::time::Instant;
 
 /// Upper bound for `timeout`, matching Overpass' own default maximum.
 pub const MAX_TIMEOUT: u32 = 180;
@@ -99,20 +102,52 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub fn router(client: Client) -> Router {
+#[derive(Clone)]
+struct AppState {
+    client: Client,
+    history: Option<History>,
+}
+
+/// `history`: optional query log; see [`crate::history`].
+pub fn router(client: Client, history: Option<History>) -> Router {
     Router::new()
         .route("/api/query", post(query))
         .route("/healthz", get(|| async { "ok" }))
-        .with_state(client)
+        .with_state(AppState { client, history })
 }
 
 async fn query(
-    State(client): State<Client>,
+    State(app): State<AppState>,
+    headers: HeaderMap,
     body: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<Response>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.body_text()))?;
+    let started = Instant::now();
+    let result = run(&app.client, &req).await;
+
+    if let Some(history) = &app.history {
+        let (status, count) = match &result {
+            Ok(resp) => (StatusCode::OK, Some(resp.elements.len())),
+            Err(e) => (e.0, None),
+        };
+        let ua = headers
+            .get(USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        history.record(Event::new(
+            &req,
+            status.as_u16(),
+            count,
+            started.elapsed(),
+            ua,
+        ));
+    }
+    result.map(Json)
+}
+
+async fn run(client: &Client, req: &QueryRequest) -> Result<Response, ApiError> {
     let q = req
         .to_query()
         .map_err(|msg| ApiError(StatusCode::BAD_REQUEST, msg))?;
-    Ok(Json(client.fetch(&q).await?))
+    Ok(client.fetch(&q).await?)
 }
