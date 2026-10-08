@@ -1,4 +1,5 @@
 use clap::Parser;
+use overpass::cache::{Cache, Config as CacheConfig};
 use overpass::client::{DEFAULT_ENDPOINT, DEFAULT_RETRIES};
 use overpass::history::History;
 use overpass::{Client, Error};
@@ -25,6 +26,22 @@ struct Cli {
     /// (e.g. amqp://app:app@rabbitmq:5672/%2f); unset disables logging
     #[arg(long, env = "RABBITMQ_URL", hide_env_values = true)]
     rabbitmq_url: Option<String>,
+
+    /// Redis URL for the response cache and limits (e.g. redis://redis:6379); unset disables them
+    #[arg(long, env = "REDIS_URL", hide_env_values = true)]
+    redis_url: Option<String>,
+
+    /// How long a cached response stays valid, seconds
+    #[arg(long, env = "CACHE_TTL", default_value_t = 600)]
+    cache_ttl: u64,
+
+    /// Upstream-bound requests per minute per client IP; 0 disables the limit
+    #[arg(long, env = "RATE_LIMIT", default_value_t = 30)]
+    rate_limit: u32,
+
+    /// Refuse all upstream requests for this many seconds after Overpass answers 429/504
+    #[arg(long, env = "BREAKER_SECS", default_value_t = 30)]
+    breaker_secs: u64,
 }
 
 fn report_retry(err: &Error, delay: Duration) {
@@ -51,6 +68,23 @@ async fn main() -> ExitCode {
         }
     };
     let history = cli.rabbitmq_url.as_deref().map(History::new);
+    let cache = match cli.redis_url.as_deref().map(|url| {
+        Cache::new(
+            url,
+            CacheConfig {
+                ttl_secs: cli.cache_ttl,
+                rate_limit: cli.rate_limit,
+                breaker_secs: cli.breaker_secs,
+            },
+        )
+    }) {
+        None => None,
+        Some(Ok(c)) => Some(c),
+        Some(Err(e)) => {
+            eprintln!("error: REDIS_URL: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let listener = match tokio::net::TcpListener::bind(cli.listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -59,13 +93,14 @@ async fn main() -> ExitCode {
         }
     };
     eprintln!(
-        "listening on {} → {}, history: {}",
+        "listening on {} → {}, history: {}, cache: {}",
         cli.listen,
         cli.endpoint,
-        if history.is_some() { "rabbitmq" } else { "off" }
+        if history.is_some() { "rabbitmq" } else { "off" },
+        if cache.is_some() { "redis" } else { "off" }
     );
 
-    let app = overpass::server::router(client, history);
+    let app = overpass::server::router(client, history, cache);
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

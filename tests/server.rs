@@ -1,4 +1,5 @@
 use overpass::Client;
+use overpass::cache::{Cache, Config as CacheConfig};
 use overpass::history::History;
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method};
@@ -10,11 +11,21 @@ async fn spawn_api(upstream: &MockServer) -> String {
 }
 
 async fn spawn_api_with_history(upstream: &MockServer, history: Option<&str>) -> String {
+    spawn_api_full(upstream, history, None).await
+}
+
+async fn spawn_api_full(
+    upstream: &MockServer,
+    history: Option<&str>,
+    cache: Option<Cache>,
+) -> String {
     let client = Client::with_endpoint(upstream.uri()).unwrap().retries(0);
     let history = history.map(|url| History::new(url));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(axum::serve(listener, overpass::server::router(client, history)).into_future());
+    tokio::spawn(
+        axum::serve(listener, overpass::server::router(client, history, cache)).into_future(),
+    );
     format!("http://{addr}")
 }
 
@@ -114,4 +125,194 @@ async fn broker_down_does_not_affect_response() {
     let (status, body) = post(&base, json!({"tags": ["a"]})).await;
     assert_eq!(status, 200);
     assert_eq!(body["elements"], json!([]));
+}
+
+fn cafe_ok() -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .set_body_string(r#"{"elements":[{"type":"node","id":1,"lat":1.0,"lon":2.0}]}"#)
+}
+
+async fn post_raw(base: &str, body: Value, ip: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/api/query"))
+        .header("x-forwarded-for", ip)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+fn x_cache(resp: &reqwest::Response) -> Option<&str> {
+    resp.headers().get("x-cache").and_then(|v| v.to_str().ok())
+}
+
+#[tokio::test]
+async fn redis_down_does_not_affect_response() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(cafe_ok())
+        .mount(&upstream)
+        .await;
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("redis://{}", dead.local_addr().unwrap());
+    drop(dead);
+    let cache = Cache::new(&url, CacheConfig::default()).unwrap();
+    let base = spawn_api_full(&upstream, None, Some(cache)).await;
+
+    let resp = post_raw(&base, json!({"tags": ["a"]}), "1.1.1.1").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(x_cache(&resp), Some("MISS"));
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+}
+
+/// Needs `REDIS_URL`; each test uses its own key prefix via unique tags/IPs, but
+/// the breaker key is global, so run with `--test-threads=1`.
+fn redis_url() -> String {
+    std::env::var("REDIS_URL").expect("REDIS_URL")
+}
+
+fn unique(tag: &str) -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{tag}-{n}")
+}
+
+async fn flush() {
+    let c = redis::Client::open(redis_url()).unwrap();
+    let mut conn = c.get_multiplexed_async_connection().await.unwrap();
+    let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs REDIS_URL"]
+async fn second_nearby_query_is_served_from_cache() {
+    flush().await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(cafe_ok())
+        .mount(&upstream)
+        .await;
+    let cache = Cache::new(&redis_url(), CacheConfig::default()).unwrap();
+    let base = spawn_api_full(&upstream, None, Some(cache)).await;
+
+    let tag = unique("amenity=cafe");
+    let a = post_raw(
+        &base,
+        json!({"tags": [tag], "around": [50.45012, 30.52341, 300]}),
+        "1.1.1.1",
+    )
+    .await;
+    assert_eq!(x_cache(&a), Some("MISS"));
+    let b = post_raw(
+        &base,
+        json!({"tags": [tag], "around": [50.45014, 30.52338, 300]}),
+        "1.1.1.1",
+    )
+    .await;
+    assert_eq!(b.status(), 200);
+    assert_eq!(x_cache(&b), Some("HIT"));
+    let body: Value = b.json().await.unwrap();
+    assert_eq!(body["elements"].as_array().unwrap().len(), 1);
+    // different radius → different key
+    let c = post_raw(
+        &base,
+        json!({"tags": [tag], "around": [50.45012, 30.52341, 301]}),
+        "1.1.1.1",
+    )
+    .await;
+    assert_eq!(x_cache(&c), Some("MISS"));
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "needs REDIS_URL"]
+async fn over_the_limit_gets_429_and_hits_are_free() {
+    flush().await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(cafe_ok())
+        .mount(&upstream)
+        .await;
+    let cfg = CacheConfig {
+        rate_limit: 3,
+        ..CacheConfig::default()
+    };
+    let base = spawn_api_full(
+        &upstream,
+        None,
+        Some(Cache::new(&redis_url(), cfg).unwrap()),
+    )
+    .await;
+
+    let ip = unique("9.9.9.9");
+    for i in 0..3 {
+        let r = post_raw(&base, json!({"tags": [format!("k{i}=v")]}), &ip).await;
+        assert_eq!(r.status(), 200, "request {i}");
+    }
+    let limited = post_raw(&base, json!({"tags": ["k99=v"]}), &ip).await;
+    assert_eq!(limited.status(), 429);
+    assert!(limited.headers().contains_key("retry-after"));
+    // a cached query still works for the limited client; another IP is unaffected
+    let hit = post_raw(&base, json!({"tags": ["k0=v"]}), &ip).await;
+    assert_eq!(x_cache(&hit), Some("HIT"));
+    let other = post_raw(&base, json!({"tags": ["k99=v"]}), "8.8.8.8").await;
+    assert_eq!(other.status(), 200);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+#[ignore = "needs REDIS_URL"]
+async fn upstream_overload_trips_the_breaker() {
+    flush().await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(504))
+        .mount(&upstream)
+        .await;
+    let base = spawn_api_full(
+        &upstream,
+        None,
+        Some(Cache::new(&redis_url(), CacheConfig::default()).unwrap()),
+    )
+    .await;
+
+    let first = post_raw(&base, json!({"tags": ["a=b"]}), "1.1.1.1").await;
+    assert_eq!(first.status(), 504);
+    let second = post_raw(&base, json!({"tags": ["c=d"]}), "1.1.1.1").await;
+    assert_eq!(second.status(), 503);
+    // the breaker answered without reaching upstream
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "needs REDIS_URL"]
+async fn concurrent_identical_queries_hit_upstream_once() {
+    flush().await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(cafe_ok().set_delay(std::time::Duration::from_millis(500)))
+        .mount(&upstream)
+        .await;
+    let base = spawn_api_full(
+        &upstream,
+        None,
+        Some(Cache::new(&redis_url(), CacheConfig::default()).unwrap()),
+    )
+    .await;
+
+    let tag = unique("shop=bakery");
+    let body = json!({"tags": [tag]});
+    let (a, b, c, d, e) = tokio::join!(
+        post_raw(&base, body.clone(), "1.1.1.1"),
+        post_raw(&base, body.clone(), "1.1.1.1"),
+        post_raw(&base, body.clone(), "1.1.1.1"),
+        post_raw(&base, body.clone(), "1.1.1.1"),
+        post_raw(&base, body.clone(), "1.1.1.1"),
+    );
+    for r in [a, b, c, d, e] {
+        assert_eq!(r.status(), 200);
+    }
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }
