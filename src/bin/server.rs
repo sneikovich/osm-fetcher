@@ -21,9 +21,10 @@ struct Cli {
     #[arg(long, env = "OVERPASS_RETRIES", default_value_t = DEFAULT_RETRIES)]
     retries: u32,
 
-    /// Base URL of the history service (e.g. http://history:8081); unset disables logging
-    #[arg(long, env = "HISTORY_URL")]
-    history_url: Option<String>,
+    /// AMQP URL of the RabbitMQ broker feeding the history service
+    /// (e.g. amqp://app:app@rabbitmq:5672/%2f); unset disables logging
+    #[arg(long, env = "RABBITMQ_URL", hide_env_values = true)]
+    rabbitmq_url: Option<String>,
 }
 
 fn report_retry(err: &Error, delay: Duration) {
@@ -49,13 +50,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let history = match cli.history_url.as_deref().map(History::new).transpose() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("error: history client: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let history = cli.rabbitmq_url.as_deref().map(History::new);
     let listener = match tokio::net::TcpListener::bind(cli.listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -67,7 +62,7 @@ async fn main() -> ExitCode {
         "listening on {} → {}, history: {}",
         cli.listen,
         cli.endpoint,
-        cli.history_url.as_deref().unwrap_or("off")
+        if history.is_some() { "rabbitmq" } else { "off" }
     );
 
     let app = overpass::server::router(client, history);
