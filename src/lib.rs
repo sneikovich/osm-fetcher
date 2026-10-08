@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod client;
 pub mod element;
 pub mod error;
