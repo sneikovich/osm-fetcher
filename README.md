@@ -52,11 +52,11 @@ OVERPASS_LISTEN=127.0.0.1:9000 OVERPASS_ENDPOINT=https://overpass.private.coffee
 | `OVERPASS_LISTEN` | `--listen` | `0.0.0.0:8080` |
 | `OVERPASS_ENDPOINT` | `--endpoint` | `https://overpass-api.de/api/interpreter` |
 | `OVERPASS_RETRIES` | `--retries` | `3` |
-| `HISTORY_URL` | `--history-url` | не задано: логування вимкнене |
+| `RABBITMQ_URL` | `--rabbitmq-url` | не задано: логування вимкнене. Напр. `amqp://app:app@rabbitmq:5672/%2f` |
 
 Endpoint задається лише на сервері, клієнт API його змінити не може. Сервер коректно завершується по SIGTERM/SIGINT.
 
-Якщо задано `HISTORY_URL`, після кожного запиту з валідним JSON фетчер у фоні шле подію в `POST {HISTORY_URL}/events` ([../history/README.md](../history/README.md)). Таймаут відправки 2 с. Помилка відправки йде лише в stderr (`history: ...`) і на відповідь клієнту не впливає.
+Якщо задано `RABBITMQ_URL`, після кожного запиту з валідним JSON фетчер у фоні публікує подію (JSON, persistent) у durable-чергу `history.events` з publisher confirm; звідти її забирає сервіс history ([../history/README.md](../history/README.md)). Брокер підключається ліниво й перепідключається сам, тож може стартувати пізніше за фетчер. Таймаут відправки 2 с. Помилка відправки йде лише в stderr (`history: ...`), подія тоді втрачається, а на відповідь клієнту це не впливає.
 
 ### `POST /api/query`
 
